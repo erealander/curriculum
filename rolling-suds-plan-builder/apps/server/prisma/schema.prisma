@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ExternalSource {
+  WORKIZ
+  MANUAL
+}
+
+enum AssessmentStatus {
+  DRAFT
+  READY
+  SENT
+}
+
+enum TagCategory {
+  concern
+  service
+  method
+  limitation
+  exclusion
+  custom
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  assessments  Assessment[]
+}
+
+model Customer {
+  id                 String       @id @default(cuid())
+  firstName          String
+  lastName           String
+  email              String?
+  phone              String?
+  companyName        String?
+  notes              String?
+  externalSource     ExternalSource?
+  externalCustomerId String?
+  properties         Property[]
+  appointments       Appointment[]
+  estimates          Estimate[]
+  assessments        Assessment[]
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+}
+
+model Property {
+  id                 String       @id @default(cuid())
+  customerId         String
+  serviceAddress     String
+  city               String
+  state              String
+  zip                String
+  propertyType       String?
+  notes              String?
+  externalSource     ExternalSource?
+  externalPropertyId String?
+  customer           Customer     @relation(fields: [customerId], references: [id])
+  appointments       Appointment[]
+  estimates          Estimate[]
+  assessments        Assessment[]
+}
+
+model Appointment {
+  id                    String          @id @default(cuid())
+  customerId            String
+  propertyId            String
+  appointmentType       String
+  scheduledStart        DateTime
+  scheduledEnd          DateTime?
+  status                String
+  assignedRep           String?
+  externalSource        ExternalSource?
+  externalAppointmentId String?
+  rawExternalPayload    Json?
+  customer              Customer        @relation(fields: [customerId], references: [id])
+  property              Property        @relation(fields: [propertyId], references: [id])
+  estimates             Estimate[]
+  assessments           Assessment[]
+}
+
+model Estimate {
+  id                 String         @id @default(cuid())
+  customerId         String
+  propertyId         String
+  appointmentId      String?
+  totalPrice         Decimal        @db.Decimal(10, 2)
+  subtotal           Decimal        @db.Decimal(10, 2)
+  tax                Decimal        @db.Decimal(10, 2)
+  status             String
+  externalSource     ExternalSource?
+  externalEstimateId String?
+  externalJobId      String?
+  rawExternalPayload Json?
+  customer           Customer       @relation(fields: [customerId], references: [id])
+  property           Property       @relation(fields: [propertyId], references: [id])
+  appointment        Appointment?   @relation(fields: [appointmentId], references: [id])
+  lineItems          EstimateLineItem[]
+  assessments        Assessment[]
+}
+
+model EstimateLineItem {
+  id                 String         @id @default(cuid())
+  estimateId         String
+  serviceName        String
+  description        String?
+  quantity           Decimal        @db.Decimal(10, 2)
+  unitPrice          Decimal        @db.Decimal(10, 2)
+  totalPrice         Decimal        @db.Decimal(10, 2)
+  sortOrder          Int            @default(0)
+  externalSource     ExternalSource?
+  externalLineItemId String?
+  estimate           Estimate       @relation(fields: [estimateId], references: [id])
+}
+
+model Assessment {
+  id                          String             @id @default(cuid())
+  customerId                  String
+  propertyId                  String
+  appointmentId               String?
+  estimateId                  String?
+  createdByUserId             String
+  reportType                  String
+  status                      AssessmentStatus   @default(DRAFT)
+  assessmentDate              DateTime           @default(now())
+  title                       String
+  overallSummary              String?
+  recommendedScope            String?
+  processDescription          String?
+  limitationsExpectations     String?
+  exclusions                  String?
+  internalNotes               String?
+  sourceImportedFromWorkiz    Boolean            @default(false)
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+  customer                    Customer           @relation(fields: [customerId], references: [id])
+  property                    Property           @relation(fields: [propertyId], references: [id])
+  appointment                 Appointment?       @relation(fields: [appointmentId], references: [id])
+  estimate                    Estimate?          @relation(fields: [estimateId], references: [id])
+  createdByUser               User               @relation(fields: [createdByUserId], references: [id])
+  photos                      Photo[]
+  observations                SurfaceObservation[]
+  pricingOptions              PricingOption[]
+  tags                        AssessmentTag[]
+}
+
+model Photo {
+  id             String      @id @default(cuid())
+  assessmentId   String
+  fileUrl        String
+  caption        String?
+  sortOrder      Int         @default(0)
+  tag            String?
+  annotationData Json?
+  assessment     Assessment  @relation(fields: [assessmentId], references: [id])
+}
+
+model SurfaceObservation {
+  id                String            @id @default(cuid())
+  assessmentId      String
+  surfaceType       String
+  conditionObserved String?
+  likelyCause       String?
+  recommendedMethod String?
+  severity          String?
+  includedInScope   Boolean           @default(true)
+  notes             String?
+  inputMode         String            @default("typed")
+  sortOrder         Int               @default(0)
+  assessment        Assessment        @relation(fields: [assessmentId], references: [id])
+  tags              ObservationTag[]
+}
+
+model PricingOption {
+  id           String      @id @default(cuid())
+  assessmentId String
+  packageName  String
+  serviceName  String
+  description  String?
+  price        Decimal     @db.Decimal(10, 2)
+  included     Boolean     @default(true)
+  sortOrder    Int         @default(0)
+  assessment   Assessment  @relation(fields: [assessmentId], references: [id])
+}
+
+model Tag {
+  id               String           @id @default(cuid())
+  name             String           @unique
+  category         TagCategory
+  color            String?
+  isSystem         Boolean          @default(false)
+  createdAt        DateTime         @default(now())
+  observationTags  ObservationTag[]
+  assessmentTags   AssessmentTag[]
+}
+
+model ObservationTag {
+  id            String              @id @default(cuid())
+  observationId String
+  tagId         String
+  observation   SurfaceObservation  @relation(fields: [observationId], references: [id])
+  tag           Tag                 @relation(fields: [tagId], references: [id])
+
+  @@unique([observationId, tagId])
+}
+
+model AssessmentTag {
+  id           String      @id @default(cuid())
+  assessmentId String
+  tagId        String
+  assessment   Assessment  @relation(fields: [assessmentId], references: [id])
+  tag          Tag         @relation(fields: [tagId], references: [id])
+
+  @@unique([assessmentId, tagId])
+}
+
+model WorkizSyncLog {
+  id             String   @id @default(cuid())
+  entityType     String
+  externalId     String
+  syncDirection  String
+  syncStatus     String
+  lastSyncedAt   DateTime @default(now())
+  errorMessage   String?
+  payloadSnapshot Json?
+}
+
+model Setting {
+  id             String   @id @default(cuid())
+  companyName    String
+  logoUrl        String?
+  phone          String?
+  email          String?
+  website        String?
+  address        String?
+  primaryColor   String?
+  secondaryColor String?
+  footerText     String?
+  disclaimerText String?
+  signatureBlock String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
