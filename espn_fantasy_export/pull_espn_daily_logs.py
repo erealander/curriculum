@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import difflib
 import json
 import logging
 import math
@@ -144,6 +145,65 @@ STAT_ID_MAP: dict[int, tuple[str, str, str]] = {
     72: ("HLD_72",      "Holds (alt id 72?)",              "pitching"),   # LOW
     113: ("SVHD_espn",  "Saves+Holds (from ESPN)",         "pitching"),   # LOW
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MLB Stats API: scoring-period → date and stat-name mappings
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Opening Day for each season (= scoring period 1).
+# Derived: period 61 ≈ 2026-05-24 → period 1 = 2026-03-25.
+_MLB_OPENING_DAYS: dict[int, date] = {
+    2026: date(2026, 3, 25),
+}
+
+# MLB Stats API field name → build_row named_stats key
+_MLB_HITTING_STAT_MAP: dict[str, str] = {
+    "atBats": "AB",
+    "hits": "H",
+    "runs": "R",
+    "homeRuns": "HR",
+    "rbi": "RBI",
+    "baseOnBalls": "BB",
+    "hitByPitch": "HBP",
+    "sacFlies": "SF",
+    "stolenBases": "SB",
+    "avg": "AVG",
+    "obp": "OBP",
+    "slg": "SLG",
+    "ops": "OPS",
+    "totalBases": "TB",
+    "plateAppearances": "PA",
+    "doubles": "2B",
+    "triples": "3B",
+    "intentionalWalks": "IBB",
+    "strikeOuts": "SO_bat",
+    "groundIntoDoublePlay": "GIDP",
+    "caughtStealing": "CS",
+}
+_MLB_PITCHING_STAT_MAP: dict[str, str] = {
+    "inningsPitched": "IP",
+    "hits": "H_allowed",
+    "baseOnBalls": "BB_allowed",
+    "earnedRuns": "ER",
+    "strikeOuts": "K",
+    "qualityStarts": "QS",
+    "wins": "W",
+    "losses": "L",
+    "saves": "SV",
+    "holds": "HLD",
+    "era": "ERA_espn",
+    "whip": "WHIP_espn",
+    "blownSaves": "BS",
+    "completeGames": "CG",
+    "homeRuns": "HR_allowed",
+    "runs": "R_allowed",
+    "gamesStarted": "GS_p",
+    "gamesPlayed": "GP_p",
+}
+# Rate stats are not summed across doubleheader games — last value wins.
+_MLB_RATE_STATS: frozenset[str] = frozenset(
+    {"AVG", "OBP", "SLG", "OPS", "ERA_espn", "WHIP_espn"}
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IP handling
@@ -588,6 +648,96 @@ def find_team_roster(
     return [], None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MLB Stats API helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scoring_period_to_date(scoring_period: int, season: int) -> date:
+    """Return the calendar date for a scoring period (period 1 = Opening Day)."""
+    start = _MLB_OPENING_DAYS.get(season)
+    if start is None:
+        raise ValueError(f"No opening day configured for season {season}")
+    return start + timedelta(days=scoring_period - 1)
+
+
+_mlbam_lookup_cache: dict[int, dict[str, int]] = {}
+
+
+def build_mlbam_lookup(season: int) -> dict[str, int]:
+    """Fetch all active MLB players for the season; return {fullName: mlbam_id}."""
+    if season in _mlbam_lookup_cache:
+        return _mlbam_lookup_cache[season]
+    resp = requests.get(
+        "https://statsapi.mlb.com/api/v1/sports/1/players",
+        params={"season": season, "fields": "people,id,fullName"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    lookup = {p["fullName"]: p["id"] for p in resp.json().get("people", [])}
+    _mlbam_lookup_cache[season] = lookup
+    return lookup
+
+
+def _find_mlbam_id(player_name: str, lookup: dict[str, int]) -> int | None:
+    """Exact-match lookup with fuzzy fallback for Jr./accent/spacing variants."""
+    if player_name in lookup:
+        return lookup[player_name]
+    matches = difflib.get_close_matches(player_name, lookup.keys(), n=1, cutoff=0.85)
+    return lookup[matches[0]] if matches else None
+
+
+_gamelog_cache: dict[int, dict[str, dict]] = {}
+
+
+def fetch_mlb_gamelog(mlbam_id: int, season: int) -> dict[str, dict]:
+    """
+    Fetch a player's season game log from the MLB Stats API.
+    Returns {YYYY-MM-DD: {col_name: value}} for all games played.
+    Cached per player to avoid re-fetching across scoring periods.
+    """
+    if mlbam_id in _gamelog_cache:
+        return _gamelog_cache[mlbam_id]
+
+    resp = requests.get(
+        f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats",
+        params={"stats": "gameLog", "season": season, "sportId": 1},
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    result: dict[str, dict] = {}
+    for stat_group in resp.json().get("stats", []):
+        group = stat_group.get("group", {}).get("displayName", "").lower()
+        stat_map = (
+            _MLB_HITTING_STAT_MAP if group == "hitting"
+            else _MLB_PITCHING_STAT_MAP if group == "pitching"
+            else {}
+        )
+        if not stat_map:
+            continue
+        for split in stat_group.get("splits", []):
+            game = split.get("game", {})
+            date_str = (
+                game.get("officialDate")           # local game date (preferred)
+                or game.get("gameDate", "")[:10]   # UTC timestamp fallback
+            )
+            if not date_str:
+                continue
+            day = result.setdefault(date_str, {})
+            for mlb_key, col_name in stat_map.items():
+                if mlb_key not in split.get("stat", {}):
+                    continue
+                val = split["stat"][mlb_key]
+                # Doubleheaders: sum counting stats; keep last value for rate stats
+                if col_name in day and col_name not in _MLB_RATE_STATS:
+                    day[col_name] = (day[col_name] or 0) + val
+                else:
+                    day[col_name] = val
+
+    _gamelog_cache[mlbam_id] = result
+    return result
+
+
 def extract_player_stats(
     player_pool_entry: dict,
     scoring_period: int,
@@ -644,13 +794,14 @@ def build_row(
     entry: dict,
     slot_map: dict[int, str],
     kona_stats: list[dict] | None = None,
+    mlb_stats: dict | None = None,
     include_raw_json: bool = False,
     warnings: list | None = None,
 ) -> dict:
     """
     Parse one roster entry into a flat output row.
-    kona_stats: stat blocks from fetch_player_stats_kona for this player; used
-    in preference to playerPoolEntry.stats which is absent in mBoxscore responses.
+    mlb_stats: pre-mapped {col_name: value} dict from the MLB Stats API (preferred).
+    kona_stats: stat blocks from fetch_player_stats_kona (fallback, currently unused).
     All fields from the spec are attempted; missing ones are None.
     """
     slot_id = entry.get("lineupSlotId")
@@ -674,7 +825,11 @@ def build_row(
     default_pos_id = player.get("defaultPositionId")
     eligible_slots = player.get("eligibleSlots", [])
 
-    named_stats, raw_stats = extract_player_stats(ppe, scoring_period, kona_stats=kona_stats)
+    if mlb_stats is not None:
+        named_stats: dict[str, Any] = mlb_stats
+        raw_stats: dict[str, Any] = {}
+    else:
+        named_stats, raw_stats = extract_player_stats(ppe, scoring_period, kona_stats=kona_stats)
 
     # ── Derived stats ─────────────────────────────────────────────────────────
     # IP decimal conversion
@@ -925,6 +1080,15 @@ def run_export(
 
     logging.info("Exporting scoring periods %d → %d", start_sp, end_sp)
 
+    season_int = int(season)
+    logging.info("Building MLBAM player ID lookup for season %d…", season_int)
+    try:
+        mlbam_lookup = build_mlbam_lookup(season_int)
+        logging.info("  MLBAM lookup: %d players.", len(mlbam_lookup))
+    except Exception as exc:
+        logging.warning("  Could not fetch MLBAM lookup: %s — stats will be empty.", exc)
+        mlbam_lookup = {}
+
     all_rows: list[dict] = []
     warnings: list[dict] = []
     failed_periods: list[int] = []
@@ -973,45 +1137,26 @@ def run_export(
             failed_periods.append(sp)
             continue
 
-        # Collect player IDs for the kona stats fetch
-        player_ids = []
-        for entry in entries:
-            ppe = entry.get("playerPoolEntry", {})
-            pid = ppe.get("id") or ppe.get("playerId") or entry.get("playerId")
-            if pid:
-                player_ids.append(int(pid))
-
-        # Fetch per-player stats via kona_player_info.
-        # mBoxscore returns lineup slots but not stats; kona fills the gap.
-        # If kona returns nothing (common for historical periods), fall back to
-        # teams[] in the same mBoxscore response.
-        kona_stats_by_player: dict[int, list[dict]] = {}
-        if player_ids:
-            kona_stats_by_player = fetch_player_stats_kona(session, base_url, sp, player_ids)
-            if kona_stats_by_player:
-                logging.info("  kona fetched stats for %d/%d players.",
-                             len(kona_stats_by_player), len(player_ids))
-            else:
-                logging.warning(
-                    "  kona returned no stats for scoringPeriodId=%d; "
-                    "trying teams[] from mBoxscore as fallback.", sp,
-                )
-                kona_stats_by_player = extract_team_stats_from_boxscore(data, team_id)
-                if kona_stats_by_player:
-                    logging.info(
-                        "  teams[] fallback: found stats for %d players.", len(kona_stats_by_player),
-                    )
-                else:
-                    logging.warning(
-                        "  teams[] fallback also returned no stats for scoringPeriodId=%d "
-                        "(no games played this period, or ESPN doesn't provide per-player stats here).", sp,
-                    )
+        period_date_str = scoring_period_to_date(sp, season_int).isoformat()
 
         period_rows = 0
         for entry in entries:
             ppe = entry.get("playerPoolEntry", {})
-            pid = ppe.get("id") or ppe.get("playerId") or entry.get("playerId")
-            kona = kona_stats_by_player.get(int(pid)) if pid else None
+            player_name = ppe.get("player", {}).get("fullName", "")
+
+            mlb_stats: dict | None = None
+            mlbam_id = _find_mlbam_id(player_name, mlbam_lookup) if player_name else None
+            if mlbam_id:
+                try:
+                    gamelog = fetch_mlb_gamelog(mlbam_id, season_int)
+                    mlb_stats = gamelog.get(period_date_str)
+                except Exception as exc:
+                    logging.warning(
+                        "  Gamelog fetch failed for %r (MLBAM %d): %s",
+                        player_name, mlbam_id, exc,
+                    )
+            elif player_name:
+                logging.warning("  No MLBAM ID found for %r", player_name)
 
             try:
                 row = build_row(
@@ -1021,7 +1166,7 @@ def run_export(
                     team_name="La Flama Blancos",
                     entry=entry,
                     slot_map=slot_map,
-                    kona_stats=kona,
+                    mlb_stats=mlb_stats,
                     include_raw_json=include_raw_json,
                     warnings=warnings,
                 )
@@ -1039,7 +1184,7 @@ def run_export(
             all_rows.append(row)
             period_rows += 1
 
-        logging.info("  scoringPeriodId=%d: parsed %d player rows.", sp, period_rows)
+        logging.info("  scoringPeriodId=%d (%s): parsed %d player rows.", sp, period_date_str, period_rows)
 
         # Small delay to be polite to ESPN's servers
         time.sleep(0.5)
