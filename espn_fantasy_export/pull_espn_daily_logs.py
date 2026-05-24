@@ -716,10 +716,9 @@ def fetch_mlb_gamelog(mlbam_id: int, season: int) -> dict[str, dict]:
         if not stat_map:
             continue
         for split in stat_group.get("splits", []):
-            game = split.get("game", {})
             date_str = (
-                game.get("officialDate")           # local game date (preferred)
-                or game.get("gameDate", "")[:10]   # UTC timestamp fallback
+                split.get("date")                          # top-level date on split (MLB Stats API)
+                or split.get("game", {}).get("officialDate")  # fallback
             )
             if not date_str:
                 continue
