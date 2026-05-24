@@ -334,6 +334,10 @@ def inspect_scoring_period(
             else:
                 print(f"    {sid:>5}: ??? UNKNOWN — check raw JSON for context")
 
+    # ─── Top-level keys in mBoxscore response ────────────────────────────────
+    print("\n─── Top-level keys in ESPN mBoxscore response ───")
+    print(f"  {sorted(data.keys())}")
+
     # ─── Stat split type IDs found in mBoxscore playerPoolEntry ──────────────
     print("\n─── Stat split type IDs found in mBoxscore playerPoolEntry.stats ───")
     split_ids = set()
@@ -363,14 +367,15 @@ def inspect_scoring_period(
             player_ids.append(int(pid))
 
     if player_ids:
-        # Test with up to 5 players so the request is small.
-        # No limit/offset — filterIds already constrains the result set.
-        # sortAppliedStatTotal is required by ESPN when any sort/limit is present.
+        # ESPN requires limit + sortAppliedStatTotal together.
+        # filterIds alone (without limit) also triggers the "sort required" error,
+        # so both must be present.
         test_ids = player_ids[:5]
         filters = {
             "players": {
                 "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
                 "filterIds": {"value": test_ids},
+                "limit": 10,
                 "sortAppliedStatTotal": {
                     "sortAway": False,
                     "sortPriority": 1,
