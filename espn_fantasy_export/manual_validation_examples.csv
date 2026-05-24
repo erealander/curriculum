@@ -1,0 +1,4 @@
+scoringPeriodId,playerName,expected_status
+1,REPLACE_WITH_REAL_PLAYER_NAME,Active
+1,REPLACE_WITH_BENCH_PLAYER_NAME,Bench
+2,REPLACE_WITH_REAL_PLAYER_NAME,Active
