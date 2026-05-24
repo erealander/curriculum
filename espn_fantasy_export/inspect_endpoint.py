@@ -160,36 +160,43 @@ def collect_leaf_paths(obj: Any, path: str = "", results: list | None = None) ->
 def inspect_settings(session: requests.Session, base: str) -> dict:
     """
     Fetch league settings to discover lineup slot definitions.
-    Returns a slot_id -> slot_name mapping.
+    Returns a slot_id -> slot_name mapping, starting from DEFAULT_SLOT_MAP
+    and updating with any names ESPN provides.
     """
     log.info("Fetching mSettings to discover lineup slot definitions…")
     data = fetch(session, base, {"view": "mSettings"})
     if not data:
-        return {}
+        log.warning("mSettings fetch failed — returning DEFAULT_SLOT_MAP only.")
+        from pull_espn_daily_logs import DEFAULT_SLOT_MAP
+        return dict(DEFAULT_SLOT_MAP)
 
-    slot_map = {}
+    # Start from the hardcoded default; ESPN settings rarely include slot names
+    # for baseball leagues but may add new/custom slot IDs.
+    try:
+        from pull_espn_daily_logs import DEFAULT_SLOT_MAP
+        slot_map: dict[int, str] = dict(DEFAULT_SLOT_MAP)
+    except ImportError:
+        slot_map = {}
+
     settings = data.get("settings", {})
 
-    # Try positionSlots (ESPN sometimes exposes slot name here)
+    # Try positionSlots — only update if ESPN provides a real name (not blank/None)
     pos_slots = settings.get("positionSlots") or settings.get("rosterSettings", {}).get("positionSlots", [])
     if pos_slots:
         for slot in pos_slots:
             sid = slot.get("slotCategoryId") or slot.get("id")
-            name = slot.get("defaultDisplay") or slot.get("abbrev") or slot.get("name") or str(sid)
-            if sid is not None:
+            name = slot.get("defaultDisplay") or slot.get("abbrev") or slot.get("name")
+            if sid is not None and name:
                 slot_map[int(sid)] = name
 
-    # Try lineupSlotCounts (keys are slot IDs, we at least know they exist)
+    # Add any new slot IDs from lineupSlotCounts not already known
     slot_counts = settings.get("rosterSettings", {}).get("lineupSlotCounts", {})
     for sid_str in slot_counts:
         sid = int(sid_str)
         if sid not in slot_map:
-            slot_map[sid] = f"slot_{sid}"
+            slot_map[sid] = f"slot_{sid}"  # genuinely unknown slot
 
-    if slot_map:
-        log.info("Found %d slot definitions from settings: %s", len(slot_map), slot_map)
-    else:
-        log.warning("Could not extract slot names from settings. Will use fallback map.")
+    log.info("Slot map (%d slots): %s", len(slot_map), slot_map)
 
     # Save settings for inspection
     (OUTPUT_DIR / "settings_sample.json").write_text(
@@ -226,6 +233,7 @@ def inspect_scoring_period(
     team_id: int,
     scoring_period: int,
     slot_map: dict,
+    dump_first_entry: bool = False,
 ) -> None:
     """
     Fetch box-score data for one scoring period and print a detailed analysis.
@@ -269,6 +277,13 @@ def inspect_scoring_period(
 
     entries = roster.get("entries", [])
     log.info("Found team on %s side. Roster has %d entries.", side, len(entries))
+
+    # ─── Raw first entry dump (--dump-first-entry) ────────────────────────────
+    if dump_first_entry and entries:
+        print("\n─── Full playerPoolEntry of first roster entry (raw JSON) ───")
+        first_ppe = entries[0].get("playerPoolEntry", {})
+        print(json.dumps(first_ppe, indent=2, default=str))
+        print("─── End of first entry dump ───\n")
 
     # ─── Slot analysis ────────────────────────────────────────────────────────
     print("\n─── Lineup Slot Analysis ───")
@@ -319,8 +334,8 @@ def inspect_scoring_period(
             else:
                 print(f"    {sid:>5}: ??? UNKNOWN — check raw JSON for context")
 
-    # ─── Stat split type IDs found ────────────────────────────────────────────
-    print("\n─── Stat split type IDs found in this period ───")
+    # ─── Stat split type IDs found in mBoxscore playerPoolEntry ──────────────
+    print("\n─── Stat split type IDs found in mBoxscore playerPoolEntry.stats ───")
     split_ids = set()
     for entry in entries:
         ppe = entry.get("playerPoolEntry", {})
@@ -330,9 +345,82 @@ def inspect_scoring_period(
                 stat_entry.get("statSplitTypeId"),
                 stat_entry.get("scoringPeriodId"),
             ))
-    for source, split, sp in sorted(split_ids):
-        label = {0: "actual", 1: "projected"}.get(source, f"source={source}")
-        print(f"  statSourceId={source} ({label}), statSplitTypeId={split}, scoringPeriodId={sp}")
+    if split_ids:
+        for source, split, sp in sorted(split_ids):
+            label = {0: "actual", 1: "projected"}.get(source, f"source={source}")
+            print(f"  statSourceId={source} ({label}), statSplitTypeId={split}, scoringPeriodId={sp}")
+    else:
+        print("  (none — mBoxscore does not include per-player stats for this period)")
+        print("  → Will probe kona_player_info below…")
+
+    # ─── Probe: kona_player_info (per-player per-period stats) ───────────────
+    print("\n─── Probe: kona_player_info (per-player stats endpoint) ───")
+    player_ids = []
+    for entry in entries:
+        ppe = entry.get("playerPoolEntry", {})
+        pid = ppe.get("id") or ppe.get("playerId") or entry.get("playerId")
+        if pid:
+            player_ids.append(int(pid))
+
+    if player_ids:
+        # Test with up to 5 players so the request is small
+        test_ids = player_ids[:5]
+        filters = {
+            "players": {
+                "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
+                "filterIds": {"value": test_ids},
+                "limit": 10,
+                "offset": 0,
+            }
+        }
+        old_filter = session.headers.pop("x-fantasy-filter", None)
+        session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
+
+        kona_data = fetch(session, base, {
+            "view": "kona_player_info",
+            "scoringPeriodId": scoring_period,
+        })
+
+        del session.headers["x-fantasy-filter"]
+        if old_filter is not None:
+            session.headers["x-fantasy-filter"] = old_filter
+
+        if kona_data:
+            kona_players = kona_data.get("players", [])
+            print(f"  kona_player_info returned {len(kona_players)} player record(s) for test IDs {test_ids}")
+            kona_has_stats = False
+            for kp in kona_players:
+                ppe_k = kp.get("playerPoolEntry", {})
+                kona_stats = ppe_k.get("stats", [])
+                pname = ppe_k.get("player", {}).get("fullName", kp.get("id", "?"))
+                actual = [s for s in kona_stats if s.get("statSourceId") == 0
+                          and s.get("scoringPeriodId") == scoring_period]
+                if actual:
+                    kona_has_stats = True
+                    non_zero = {k: v for k, v in actual[0].get("stats", {}).items() if v != 0}
+                    print(f"  ✓ {pname}: {len(actual)} actual stat block(s), "
+                          f"non-zero stat IDs: {list(non_zero.keys())[:15]}")
+                else:
+                    print(f"  ✗ {pname}: kona returned stats but none matched "
+                          f"scoringPeriodId={scoring_period} with statSourceId=0")
+
+            if kona_has_stats:
+                print("\n  → kona_player_info WORKS for per-player stats.")
+                print("    pull_espn_daily_logs.py will use this approach automatically.")
+            else:
+                print(f"\n  → kona_player_info returned data but no actual stats for period {scoring_period}.")
+                print("    Try a later scoring period: python3 inspect_endpoint.py --scoring-period 50")
+
+            # Save kona sample
+            kona_path = OUTPUT_DIR / "kona_sample.json"
+            kona_path.write_text(json.dumps(kona_data, indent=2, default=str))
+            log.info("Saved kona_player_info sample to outputs/kona_sample.json")
+        else:
+            print("  → kona_player_info returned no data.")
+            print("    This may mean: (a) credentials expired, (b) no games this period, "
+                  "or (c) kona is not available for this league.")
+    else:
+        print("  → No player IDs found — cannot probe kona.")
 
     # ─── IP format detection ───────────────────────────────────────────────────
     print("\n─── IP (Innings Pitched) format check ───")
@@ -387,6 +475,9 @@ def main() -> None:
                         help="Which scoringPeriodId to inspect (default: 1)")
     parser.add_argument("--show-raw", action="store_true",
                         help="Print full raw JSON to stdout (can be very long)")
+    parser.add_argument("--dump-first-entry", action="store_true",
+                        help="Print the full raw JSON of the first playerPoolEntry "
+                             "(useful for diagnosing missing stats)")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -403,7 +494,10 @@ def main() -> None:
 
     slot_map = inspect_settings(session, base)
 
-    inspect_scoring_period(session, base, team_id, args.scoring_period, slot_map)
+    inspect_scoring_period(
+        session, base, team_id, args.scoring_period, slot_map,
+        dump_first_entry=args.dump_first_entry,
+    )
 
     if args.show_raw:
         sample = OUTPUT_DIR / "endpoint_sample.json"

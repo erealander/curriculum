@@ -351,32 +351,39 @@ def load_league_settings(
         result["final_scoring_period"],
     )
 
-    # Slot name map — try several known field paths
+    # Slot name map — start from DEFAULT_SLOT_MAP and update with any names ESPN provides.
+    # ESPN settings rarely include readable names for baseball leagues; the default map
+    # is more reliable than relying solely on the API response.
     pos_slots = (
         settings.get("positionSlots")
         or settings.get("rosterSettings", {}).get("positionSlots")
         or []
     )
     if pos_slots:
-        slot_map: dict[int, str] = {}
+        names_added = 0
         for slot in pos_slots:
             sid = slot.get("slotCategoryId") or slot.get("id")
             name = (
                 slot.get("defaultDisplay")
                 or slot.get("abbrev")
                 or slot.get("name")
-                or f"slot_{sid}"
             )
-            if sid is not None:
-                slot_map[int(sid)] = name
-        if slot_map:
-            result["slot_map"] = slot_map
-            logging.info("Loaded %d slot names from mSettings.", len(slot_map))
+            # Only overwrite if ESPN actually provided a real name
+            if sid is not None and name:
+                result["slot_map"][int(sid)] = name
+                names_added += 1
+        logging.info("Updated slot map with %d real names from mSettings.", names_added)
     else:
         logging.warning(
             "mSettings did not contain positionSlots. Using DEFAULT_SLOT_MAP. "
             "Run inspect_endpoint.py to validate."
         )
+    # Add any new slot IDs from lineupSlotCounts not already in the map
+    slot_counts = settings.get("rosterSettings", {}).get("lineupSlotCounts", {})
+    for sid_str in slot_counts:
+        sid = int(sid_str)
+        if sid not in result["slot_map"]:
+            result["slot_map"][sid] = f"slot_{sid}"
 
     # Schedule (to map scoringPeriodId → matchupPeriodId)
     logging.info("Fetching schedule for SP→matchup period map…")
@@ -424,6 +431,59 @@ def fetch_boxscore(
     )
 
 
+def fetch_player_stats_kona(
+    session: requests.Session,
+    base_url: str,
+    scoring_period: int,
+    player_ids: list[int],
+) -> dict[int, list[dict]]:
+    """
+    Fetch per-player per-scoring-period stats via ESPN's kona_player_info view.
+
+    The mBoxscore view returns lineup slots but not stats. The kona_player_info
+    view with an x-fantasy-filter header returns per-player stat blocks for a
+    specific scoring period. Returns {player_id: [stat_block, ...]} for each
+    player found.
+    """
+    if not player_ids:
+        return {}
+
+    filters = {
+        "players": {
+            "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
+            "filterIds": {"value": player_ids},
+            "limit": len(player_ids) + 10,
+            "offset": 0,
+        }
+    }
+
+    old_filter = session.headers.pop("x-fantasy-filter", None)
+    session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
+
+    data = fetch_json(
+        session,
+        base_url,
+        {"view": "kona_player_info", "scoringPeriodId": scoring_period},
+    )
+
+    del session.headers["x-fantasy-filter"]
+    if old_filter is not None:
+        session.headers["x-fantasy-filter"] = old_filter
+
+    if not data:
+        return {}
+
+    result: dict[int, list[dict]] = {}
+    for player in data.get("players", []):
+        pid = player.get("id")
+        ppe = player.get("playerPoolEntry", {})
+        stats = ppe.get("stats", [])
+        if pid is not None and stats:
+            result[int(pid)] = stats
+
+    return result
+
+
 def find_team_roster(
     schedule: list,
     team_id: int,
@@ -455,23 +515,28 @@ def find_team_roster(
 def extract_player_stats(
     player_pool_entry: dict,
     scoring_period: int,
+    kona_stats: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """
-    Extract actual per-scoring-period stats from a playerPoolEntry.
+    Extract actual per-scoring-period stats for a player.
+
+    Tries (in order):
+      1. kona_stats — stat blocks from fetch_player_stats_kona (preferred)
+      2. player_pool_entry.stats — from the mBoxscore response (fallback)
 
     Returns:
         (named_stats, raw_stats_dict) where named_stats maps column names to
-        values and raw_stats_dict maps stat_id → value for all found stats.
+        values and raw_stats_dict maps stat_id → value for all stats found.
     """
     named: dict[str, Any] = {}
     raw: dict[str, Any] = {}
 
-    for stat_block in player_pool_entry.get("stats", []):
-        # Only take actual (not projected) stats for this scoring period
+    stat_blocks = kona_stats if kona_stats else player_pool_entry.get("stats", [])
+
+    for stat_block in stat_blocks:
+        # Only take actual (not projected) stats
         if stat_block.get("statSourceId", -1) != 0:
             continue
-        # Prefer split type 5 (per scoring period); fall back to any actual stats
-        split = stat_block.get("statSplitTypeId")
         sp_id = stat_block.get("scoringPeriodId")
         if sp_id is not None and sp_id != scoring_period:
             continue
@@ -481,9 +546,7 @@ def extract_player_stats(
             raw[sid] = value
             info = STAT_ID_MAP.get(sid)
             if info:
-                col_name = info[0]
-                # Take the last value seen if there are multiple stat blocks
-                named[col_name] = value
+                named[info[0]] = value
 
     return named, raw
 
@@ -495,11 +558,14 @@ def build_row(
     team_name: str,
     entry: dict,
     slot_map: dict[int, str],
+    kona_stats: list[dict] | None = None,
     include_raw_json: bool = False,
     warnings: list | None = None,
 ) -> dict:
     """
     Parse one roster entry into a flat output row.
+    kona_stats: stat blocks from fetch_player_stats_kona for this player; used
+    in preference to playerPoolEntry.stats which is absent in mBoxscore responses.
     All fields from the spec are attempted; missing ones are None.
     """
     slot_id = entry.get("lineupSlotId")
@@ -523,7 +589,7 @@ def build_row(
     default_pos_id = player.get("defaultPositionId")
     eligible_slots = player.get("eligibleSlots", [])
 
-    named_stats, raw_stats = extract_player_stats(ppe, scoring_period)
+    named_stats, raw_stats = extract_player_stats(ppe, scoring_period, kona_stats=kona_stats)
 
     # ── Derived stats ─────────────────────────────────────────────────────────
     # IP decimal conversion
@@ -822,8 +888,32 @@ def run_export(
             failed_periods.append(sp)
             continue
 
+        # Collect player IDs for the kona stats fetch
+        player_ids = []
+        for entry in entries:
+            ppe = entry.get("playerPoolEntry", {})
+            pid = ppe.get("id") or ppe.get("playerId") or entry.get("playerId")
+            if pid:
+                player_ids.append(int(pid))
+
+        # Fetch per-player stats via kona_player_info.
+        # mBoxscore returns lineup slots but not stats; kona fills the gap.
+        kona_stats_by_player: dict[int, list[dict]] = {}
+        if player_ids:
+            kona_stats_by_player = fetch_player_stats_kona(session, base_url, sp, player_ids)
+            if kona_stats_by_player:
+                logging.info("  kona fetched stats for %d/%d players.",
+                             len(kona_stats_by_player), len(player_ids))
+            else:
+                logging.warning("  kona returned no stats for scoringPeriodId=%d "
+                                "(no games played this period, or kona unavailable).", sp)
+
         period_rows = 0
         for entry in entries:
+            ppe = entry.get("playerPoolEntry", {})
+            pid = ppe.get("id") or ppe.get("playerId") or entry.get("playerId")
+            kona = kona_stats_by_player.get(int(pid)) if pid else None
+
             try:
                 row = build_row(
                     scoring_period=sp,
@@ -832,6 +922,7 @@ def run_export(
                     team_name="La Flama Blancos",
                     entry=entry,
                     slot_map=slot_map,
+                    kona_stats=kona,
                     include_raw_json=include_raw_json,
                     warnings=warnings,
                 )
