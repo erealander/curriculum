@@ -338,6 +338,42 @@ def inspect_scoring_period(
     print("\n─── Top-level keys in ESPN mBoxscore response ───")
     print(f"  {sorted(data.keys())}")
 
+    # ─── Check teams[] for per-player stats ───────────────────────────────────
+    # The schedule[] gives lineup slot assignments; teams[] may carry full
+    # playerPoolEntry.stats that schedule[] omits.
+    print("\n─── Checking teams[] key for player stats ───")
+    teams = data.get("teams", [])
+    print(f"  teams[] has {len(teams)} entries")
+    my_team = next((t for t in teams if t.get("id") == team_id), None)
+    if my_team:
+        print(f"  Found teamId={team_id} in teams[]")
+        print(f"  Top-level keys in my team entry: {sorted(my_team.keys())}")
+        roster_obj = (
+            my_team.get("roster")
+            or my_team.get("rosterForCurrentScoringPeriod")
+        )
+        if roster_obj:
+            t_entries = roster_obj.get("entries", [])
+            print(f"  teams[] roster has {len(t_entries)} entries")
+            if t_entries:
+                first_ppe = t_entries[0].get("playerPoolEntry", {})
+                print(f"  First playerPoolEntry keys: {sorted(first_ppe.keys())}")
+                has_stats = bool(first_ppe.get("stats"))
+                print(f"  Has stats: {has_stats}")
+                if has_stats:
+                    print(f"  First player stats blocks: {len(first_ppe['stats'])}")
+                    for sb in first_ppe["stats"][:3]:
+                        non_zero = {k: v for k, v in sb.get("stats", {}).items() if v != 0}
+                        print(f"    scoringPeriodId={sb.get('scoringPeriodId')} "
+                              f"source={sb.get('statSourceId')} "
+                              f"split={sb.get('statSplitTypeId')} "
+                              f"non-zero: {list(non_zero.keys())[:10]}")
+        else:
+            print(f"  No 'roster' key found. Keys: {sorted(my_team.keys())}")
+    else:
+        team_ids = [t.get("id") for t in teams]
+        print(f"  teamId={team_id} not found in teams[]. IDs present: {team_ids[:10]}")
+
     # ─── Stat split type IDs found in mBoxscore playerPoolEntry ──────────────
     print("\n─── Stat split type IDs found in mBoxscore playerPoolEntry.stats ───")
     split_ids = set()
@@ -371,13 +407,14 @@ def inspect_scoring_period(
         # filterIds alone (without limit) also triggers the "sort required" error,
         # so both must be present.
         test_ids = player_ids[:5]
+        # sortAppliedStatTotal: sortAway is NOT a valid field (ESPN returns 400).
+        # Only value and sortPriority are accepted.
         filters = {
             "players": {
                 "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
                 "filterIds": {"value": test_ids},
                 "limit": 10,
                 "sortAppliedStatTotal": {
-                    "sortAway": False,
                     "sortPriority": 1,
                     "value": f"002026{scoring_period:03d}",
                 },

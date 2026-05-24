@@ -457,7 +457,6 @@ def fetch_player_stats_kona(
             "filterIds": {"value": player_ids},
             "limit": len(player_ids) + 5,
             "sortAppliedStatTotal": {
-                "sortAway": False,
                 "sortPriority": 1,
                 "value": f"00{season_str}{scoring_period:03d}",
             },
