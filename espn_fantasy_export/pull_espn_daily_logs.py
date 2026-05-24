@@ -448,12 +448,19 @@ def fetch_player_stats_kona(
     if not player_ids:
         return {}
 
+    # No limit/offset — filterIds already constrains results to our players.
+    # sortAppliedStatTotal is required by ESPN's API when any sort/limit is used;
+    # value format: "00" + season (4-digit) + scoring_period (3-digit zero-padded).
+    season_str = base_url.split("/seasons/")[1].split("/")[0] if "/seasons/" in base_url else "2026"
     filters = {
         "players": {
             "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
             "filterIds": {"value": player_ids},
-            "limit": len(player_ids) + 10,
-            "offset": 0,
+            "sortAppliedStatTotal": {
+                "sortAway": False,
+                "sortPriority": 1,
+                "value": f"00{season_str}{scoring_period:03d}",
+            },
         }
     }
 

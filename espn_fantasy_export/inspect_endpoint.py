@@ -363,14 +363,19 @@ def inspect_scoring_period(
             player_ids.append(int(pid))
 
     if player_ids:
-        # Test with up to 5 players so the request is small
+        # Test with up to 5 players so the request is small.
+        # No limit/offset — filterIds already constrains the result set.
+        # sortAppliedStatTotal is required by ESPN when any sort/limit is present.
         test_ids = player_ids[:5]
         filters = {
             "players": {
                 "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
                 "filterIds": {"value": test_ids},
-                "limit": 10,
-                "offset": 0,
+                "sortAppliedStatTotal": {
+                    "sortAway": False,
+                    "sortPriority": 1,
+                    "value": f"002026{scoring_period:03d}",
+                },
             }
         }
         old_filter = session.headers.pop("x-fantasy-filter", None)
