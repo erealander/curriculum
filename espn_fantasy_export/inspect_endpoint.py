@@ -436,27 +436,75 @@ def inspect_scoring_period(
             kona_players = kona_data.get("players", [])
             print(f"  kona_player_info returned {len(kona_players)} player record(s) for test IDs {test_ids}")
             kona_has_stats = False
+
+            # When the first player has empty stats, print the raw entry structure to
+            # help diagnose whether the issue is the filter, the period, or ESPN's API.
+            if kona_players:
+                first_kp = kona_players[0]
+                first_ppe = first_kp.get("playerPoolEntry", {})
+                first_stats = first_ppe.get("stats", [])
+                if not first_stats:
+                    print("\n  ── Raw kona entry structure (first player) ──")
+                    print(f"    player entry keys:        {sorted(first_kp.keys())}")
+                    print(f"    playerPoolEntry keys:     {sorted(first_ppe.keys())}")
+                    player_sub = first_ppe.get("player", {})
+                    if player_sub:
+                        print(f"    playerPoolEntry.player keys: {sorted(player_sub.keys())}")
+                    else:
+                        print("    playerPoolEntry.player:   (missing — fullName not available here)")
+                    print(f"    playerPoolEntry.stats:    [] (empty — ESPN returned no stat blocks)")
+                    print(
+                        "\n  Likely causes:"
+                        "\n    1. filterStatsForCurrentSeasonScoringPeriodId is too restrictive for"
+                        " historical periods — pull_espn_daily_logs.py now retries without it."
+                        "\n    2. No MLB games were played for these players on this scoring period."
+                        f"\n    3. Period {scoring_period} may be too early; try --scoring-period with"
+                        " a recent date, e.g. one or two below the current period."
+                    )
+
             for kp in kona_players:
                 ppe_k = kp.get("playerPoolEntry", {})
                 kona_stats = ppe_k.get("stats", [])
-                pname = ppe_k.get("player", {}).get("fullName", kp.get("id", "?"))
+                pname = (
+                    ppe_k.get("player", {}).get("fullName")
+                    or ppe_k.get("player", {}).get("firstName", "")
+                    + " " + ppe_k.get("player", {}).get("lastName", "")
+                ).strip() or str(kp.get("id", "?"))
+
+                if not kona_stats:
+                    print(f"  ✗ {pname}: playerPoolEntry.stats is empty (ESPN returned no stat blocks)")
+                    continue
+
+                # Show all stat blocks (not just statSourceId=0 / scoringPeriodId match)
+                # so we can see what ESPN actually returned.
                 actual = [s for s in kona_stats if s.get("statSourceId") == 0
                           and s.get("scoringPeriodId") == scoring_period]
                 if actual:
                     kona_has_stats = True
                     non_zero = {k: v for k, v in actual[0].get("stats", {}).items() if v != 0}
-                    print(f"  ✓ {pname}: {len(actual)} actual stat block(s), "
+                    print(f"  ✓ {pname}: {len(actual)} actual stat block(s) matching period, "
                           f"non-zero stat IDs: {list(non_zero.keys())[:15]}")
                 else:
-                    print(f"  ✗ {pname}: kona returned stats but none matched "
-                          f"scoringPeriodId={scoring_period} with statSourceId=0")
+                    # Show what blocks ARE there so we can diagnose the mismatch
+                    all_periods = [(s.get("scoringPeriodId"), s.get("statSourceId"),
+                                    s.get("statSplitTypeId")) for s in kona_stats[:5]]
+                    print(f"  ~ {pname}: {len(kona_stats)} stat block(s) returned but none match "
+                          f"scoringPeriodId={scoring_period} + statSourceId=0")
+                    print(f"    Blocks present (period, source, split): {all_periods}")
 
             if kona_has_stats:
                 print("\n  → kona_player_info WORKS for per-player stats.")
                 print("    pull_espn_daily_logs.py will use this approach automatically.")
+            elif kona_players and any(kp.get("playerPoolEntry", {}).get("stats") for kp in kona_players):
+                print(f"\n  → kona returned stats but none matched scoringPeriodId={scoring_period} "
+                      "with statSourceId=0.")
+                print("    The stat blocks above show what periods/sources ARE available.")
+                print("    pull_espn_daily_logs.py will extract any statSourceId=0 blocks it finds.")
             else:
-                print(f"\n  → kona_player_info returned data but no actual stats for period {scoring_period}.")
-                print("    Try a later scoring period: python3 inspect_endpoint.py --scoring-period 50")
+                print(f"\n  → kona_player_info returned {len(kona_players)} player object(s) but "
+                      "all had empty stats arrays.")
+                print("    pull_espn_daily_logs.py will retry without the period filter, then fall back")
+                print("    to teams[] stats in the mBoxscore response.")
 
             # Save kona sample
             kona_path = OUTPUT_DIR / "kona_sample.json"

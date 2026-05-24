@@ -444,49 +444,107 @@ def fetch_player_stats_kona(
     view with an x-fantasy-filter header returns per-player stat blocks for a
     specific scoring period. Returns {player_id: [stat_block, ...]} for each
     player found.
+
+    Tries two filter variants: with filterStatsForCurrentSeasonScoringPeriodId
+    first (returns only stats for the requested period), then without it (returns
+    all stat blocks so the caller can filter by scoringPeriodId locally). ESPN
+    sometimes omits stats with the period filter for historical scoring periods.
     """
     if not player_ids:
         return {}
 
-    # ESPN requires limit + sortAppliedStatTotal together; either alone causes a 400.
-    # value format for sortAppliedStatTotal: "00" + season (4-digit) + period (3-digit zero-padded).
     season_str = base_url.split("/seasons/")[1].split("/")[0] if "/seasons/" in base_url else "2026"
-    filters = {
-        "players": {
-            "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
-            "filterIds": {"value": player_ids},
-            "limit": len(player_ids) + 5,
-            "sortAppliedStatTotal": {
-                "sortPriority": 1,
-                "value": f"00{season_str}{scoring_period:03d}",
-            },
-        }
-    }
 
-    old_filter = session.headers.pop("x-fantasy-filter", None)
-    session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
+    filter_variants = [
+        # Variant 1: ESPN-side period filter (preferred; may return empty for historical periods)
+        {
+            "players": {
+                "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
+                "filterIds": {"value": player_ids},
+                "limit": len(player_ids) + 5,
+                "sortAppliedStatTotal": {
+                    "sortPriority": 1,
+                    "value": f"00{season_str}{scoring_period:03d}",
+                },
+            }
+        },
+        # Variant 2: No period filter; ESPN returns all stat blocks and we filter locally
+        {
+            "players": {
+                "filterIds": {"value": player_ids},
+                "limit": len(player_ids) + 5,
+                "sortAppliedStatTotal": {
+                    "sortPriority": 1,
+                    "value": f"00{season_str}{scoring_period:03d}",
+                },
+            }
+        },
+    ]
 
-    data = fetch_json(
-        session,
-        base_url,
-        {"view": "kona_player_info", "scoringPeriodId": scoring_period},
-    )
+    for attempt, filters in enumerate(filter_variants):
+        old_filter = session.headers.pop("x-fantasy-filter", None)
+        session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
 
-    del session.headers["x-fantasy-filter"]
-    if old_filter is not None:
-        session.headers["x-fantasy-filter"] = old_filter
+        data = fetch_json(
+            session,
+            base_url,
+            {"view": "kona_player_info", "scoringPeriodId": scoring_period},
+        )
 
-    if not data:
-        return {}
+        del session.headers["x-fantasy-filter"]
+        if old_filter is not None:
+            session.headers["x-fantasy-filter"] = old_filter
 
+        if not data:
+            continue
+
+        result: dict[int, list[dict]] = {}
+        for player in data.get("players", []):
+            pid = player.get("id")
+            ppe = player.get("playerPoolEntry", {})
+            stats = ppe.get("stats", [])
+            if pid is not None and stats:
+                result[int(pid)] = stats
+
+        if result:
+            if attempt > 0:
+                logging.info("  kona: variant 2 (no period filter) succeeded for %d players.", len(result))
+            return result
+
+        if attempt == 0 and data.get("players"):
+            logging.debug(
+                "  kona variant 1 returned %d player objects but all had empty stats; "
+                "retrying without filterStatsForCurrentSeasonScoringPeriodId.",
+                len(data.get("players", [])),
+            )
+
+    return {}
+
+
+def extract_team_stats_from_boxscore(
+    data: dict,
+    team_id: int,
+) -> dict[int, list[dict]]:
+    """
+    Fallback stats source: extract playerPoolEntry.stats from teams[] in a
+    mBoxscore response. teams[] is populated even when schedule[].
+    rosterForCurrentScoringPeriod.entries[].playerPoolEntry.stats is absent.
+    Returns {player_id: [stat_block, ...]} for players that have any stats.
+    """
     result: dict[int, list[dict]] = {}
-    for player in data.get("players", []):
-        pid = player.get("id")
-        ppe = player.get("playerPoolEntry", {})
-        stats = ppe.get("stats", [])
-        if pid is not None and stats:
-            result[int(pid)] = stats
-
+    for team in data.get("teams", []):
+        if team.get("id") != team_id:
+            continue
+        roster_obj = (
+            team.get("roster")
+            or team.get("rosterForCurrentScoringPeriod", {})
+        )
+        for entry in roster_obj.get("entries", []):
+            ppe = entry.get("playerPoolEntry", {})
+            pid = ppe.get("id") or ppe.get("playerId")
+            stats = ppe.get("stats", [])
+            if pid is not None and stats:
+                result[int(pid)] = stats
     return result
 
 
@@ -904,6 +962,8 @@ def run_export(
 
         # Fetch per-player stats via kona_player_info.
         # mBoxscore returns lineup slots but not stats; kona fills the gap.
+        # If kona returns nothing (common for historical periods), fall back to
+        # teams[] in the same mBoxscore response.
         kona_stats_by_player: dict[int, list[dict]] = {}
         if player_ids:
             kona_stats_by_player = fetch_player_stats_kona(session, base_url, sp, player_ids)
@@ -911,8 +971,20 @@ def run_export(
                 logging.info("  kona fetched stats for %d/%d players.",
                              len(kona_stats_by_player), len(player_ids))
             else:
-                logging.warning("  kona returned no stats for scoringPeriodId=%d "
-                                "(no games played this period, or kona unavailable).", sp)
+                logging.warning(
+                    "  kona returned no stats for scoringPeriodId=%d; "
+                    "trying teams[] from mBoxscore as fallback.", sp,
+                )
+                kona_stats_by_player = extract_team_stats_from_boxscore(data, team_id)
+                if kona_stats_by_player:
+                    logging.info(
+                        "  teams[] fallback: found stats for %d players.", len(kona_stats_by_player),
+                    )
+                else:
+                    logging.warning(
+                        "  teams[] fallback also returned no stats for scoringPeriodId=%d "
+                        "(no games played this period, or ESPN doesn't provide per-player stats here).", sp,
+                    )
 
         period_rows = 0
         for entry in entries:
