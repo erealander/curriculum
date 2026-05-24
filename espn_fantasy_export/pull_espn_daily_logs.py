@@ -431,6 +431,11 @@ def fetch_boxscore(
     )
 
 
+# ESPN rejects kona_player_info requests that contain too many player IDs
+# in filterIds. Batching to this size keeps each request within ESPN's limit.
+_KONA_BATCH_SIZE = 10
+
+
 def fetch_player_stats_kona(
     session: requests.Session,
     base_url: str,
@@ -440,85 +445,92 @@ def fetch_player_stats_kona(
     """
     Fetch per-player per-scoring-period stats via ESPN's kona_player_info view.
 
-    The mBoxscore view returns lineup slots but not stats. The kona_player_info
-    view with an x-fantasy-filter header returns per-player stat blocks for a
-    specific scoring period. Returns {player_id: [stat_block, ...]} for each
-    player found.
+    ESPN returns HTTP 400 when filterIds contains too many player IDs in a single
+    request. Requests are therefore batched in groups of _KONA_BATCH_SIZE and
+    results merged. Each batch tries two filter variants:
+      1. With filterStatsForCurrentSeasonScoringPeriodId (preferred)
+      2. Without it, returning all stat blocks for local filtering (fallback for
+         historical periods where ESPN omits stats with the period filter)
 
-    Tries two filter variants: with filterStatsForCurrentSeasonScoringPeriodId
-    first (returns only stats for the requested period), then without it (returns
-    all stat blocks so the caller can filter by scoringPeriodId locally). ESPN
-    sometimes omits stats with the period filter for historical scoring periods.
+    Returns {player_id: [stat_block, ...]} for each player found.
     """
     if not player_ids:
         return {}
 
     season_str = base_url.split("/seasons/")[1].split("/")[0] if "/seasons/" in base_url else "2026"
+    merged: dict[int, list[dict]] = {}
 
-    filter_variants = [
-        # Variant 1: ESPN-side period filter (preferred; may return empty for historical periods)
-        {
-            "players": {
-                "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
-                "filterIds": {"value": player_ids},
-                "limit": len(player_ids) + 5,
-                "sortAppliedStatTotal": {
-                    "sortPriority": 1,
-                    "value": f"00{season_str}{scoring_period:03d}",
-                },
-            }
-        },
-        # Variant 2: No period filter; ESPN returns all stat blocks and we filter locally
-        {
-            "players": {
-                "filterIds": {"value": player_ids},
-                "limit": len(player_ids) + 5,
-                "sortAppliedStatTotal": {
-                    "sortPriority": 1,
-                    "value": f"00{season_str}{scoring_period:03d}",
-                },
-            }
-        },
-    ]
+    for batch_start in range(0, len(player_ids), _KONA_BATCH_SIZE):
+        batch = player_ids[batch_start: batch_start + _KONA_BATCH_SIZE]
 
-    for attempt, filters in enumerate(filter_variants):
-        old_filter = session.headers.pop("x-fantasy-filter", None)
-        session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
+        filter_variants = [
+            # Variant 1: ESPN-side period filter (preferred)
+            {
+                "players": {
+                    "filterStatsForCurrentSeasonScoringPeriodId": {"value": [scoring_period]},
+                    "filterIds": {"value": batch},
+                    "limit": len(batch) + 5,
+                    "sortAppliedStatTotal": {
+                        "sortPriority": 1,
+                        "value": f"00{season_str}{scoring_period:03d}",
+                    },
+                }
+            },
+            # Variant 2: No period filter; filter locally from returned blocks
+            {
+                "players": {
+                    "filterIds": {"value": batch},
+                    "limit": len(batch) + 5,
+                    "sortAppliedStatTotal": {
+                        "sortPriority": 1,
+                        "value": f"00{season_str}{scoring_period:03d}",
+                    },
+                }
+            },
+        ]
 
-        data = fetch_json(
-            session,
-            base_url,
-            {"view": "kona_player_info", "scoringPeriodId": scoring_period},
-        )
+        for attempt, filters in enumerate(filter_variants):
+            old_filter = session.headers.pop("x-fantasy-filter", None)
+            session.headers["x-fantasy-filter"] = json.dumps(filters, separators=(",", ":"))
 
-        del session.headers["x-fantasy-filter"]
-        if old_filter is not None:
-            session.headers["x-fantasy-filter"] = old_filter
-
-        if not data:
-            continue
-
-        result: dict[int, list[dict]] = {}
-        for player in data.get("players", []):
-            pid = player.get("id")
-            ppe = player.get("playerPoolEntry", {})
-            stats = ppe.get("stats", [])
-            if pid is not None and stats:
-                result[int(pid)] = stats
-
-        if result:
-            if attempt > 0:
-                logging.info("  kona: variant 2 (no period filter) succeeded for %d players.", len(result))
-            return result
-
-        if attempt == 0 and data.get("players"):
-            logging.debug(
-                "  kona variant 1 returned %d player objects but all had empty stats; "
-                "retrying without filterStatsForCurrentSeasonScoringPeriodId.",
-                len(data.get("players", [])),
+            data = fetch_json(
+                session,
+                base_url,
+                {"view": "kona_player_info", "scoringPeriodId": scoring_period},
             )
 
-    return {}
+            del session.headers["x-fantasy-filter"]
+            if old_filter is not None:
+                session.headers["x-fantasy-filter"] = old_filter
+
+            if not data:
+                continue
+
+            batch_result: dict[int, list[dict]] = {}
+            for player in data.get("players", []):
+                pid = player.get("id")
+                ppe = player.get("playerPoolEntry", {})
+                stats = ppe.get("stats", [])
+                if pid is not None and stats:
+                    batch_result[int(pid)] = stats
+
+            if batch_result:
+                if attempt > 0:
+                    logging.debug(
+                        "  kona batch %d–%d: variant 2 (no period filter) succeeded.",
+                        batch_start, batch_start + len(batch) - 1,
+                    )
+                merged.update(batch_result)
+                break  # move to next batch
+
+            if attempt == 0 and data.get("players"):
+                logging.debug(
+                    "  kona batch %d–%d: variant 1 returned players with empty stats; "
+                    "retrying without period filter.",
+                    batch_start, batch_start + len(batch) - 1,
+                )
+
+    return merged
 
 
 def extract_team_stats_from_boxscore(
