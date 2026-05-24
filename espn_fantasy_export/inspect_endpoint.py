@@ -28,8 +28,11 @@ import requests
 from dotenv import load_dotenv
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
+
+# ESPN moved their Fantasy Baseball API to lm-api-reads in 2024.
+# The old fantasy.espn.com/apis/v3/... URL now returns HTML instead of JSON.
 BASE_URL = (
-    "https://fantasy.espn.com/apis/v3/games/flb"
+    "https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb"
     "/seasons/{season}/segments/0/leagues/{league_id}"
 )
 
@@ -67,8 +70,16 @@ def build_session(swid: str, espn_s2: str) -> requests.Session:
     session.cookies.set("SWID", swid)
     session.cookies.set("espn_s2", espn_s2)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; espn-fantasy-export/1.0)",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://fantasy.espn.com/baseball/",
+        "x-fantasy-source": "kona",
+        "x-fantasy-platform": "kona-PROD",
     })
     return session
 
