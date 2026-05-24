@@ -595,16 +595,25 @@ def extract_player_stats(
     named: dict[str, Any] = {}
     raw: dict[str, Any] = {}
 
-    stat_blocks = kona_stats if kona_stats else player_pool_entry.get("stats", [])
+    if kona_stats is not None:
+        # kona was already scoped to this scoring period in the request.
+        # ESPN sometimes returns daily stats under a different scoringPeriodId
+        # than requested, tagged with statSplitTypeId=5 (daily split).
+        # Priority: exact period match → daily-split blocks → give up.
+        # Never fall through to season totals (statSplitTypeId=0) for a daily log.
+        actual = [s for s in kona_stats if s.get("statSourceId", -1) == 0]
+        exact = [s for s in actual if s.get("scoringPeriodId") == scoring_period]
+        daily = [s for s in actual if s.get("statSplitTypeId") == 5]
+        stat_blocks = exact or daily
+    else:
+        # mBoxscore fallback: enforce period to avoid picking up weekly/season blocks.
+        stat_blocks = [
+            s for s in player_pool_entry.get("stats", [])
+            if s.get("statSourceId", -1) == 0
+            and (s.get("scoringPeriodId") is None or s.get("scoringPeriodId") == scoring_period)
+        ]
 
     for stat_block in stat_blocks:
-        # Only take actual (not projected) stats
-        if stat_block.get("statSourceId", -1) != 0:
-            continue
-        sp_id = stat_block.get("scoringPeriodId")
-        if sp_id is not None and sp_id != scoring_period:
-            continue
-
         for str_id, value in stat_block.get("stats", {}).items():
             sid = int(str_id)
             raw[sid] = value
