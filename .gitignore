@@ -2,3 +2,5 @@ test.rb
 .DS_Store
 *.swp
 .vscode/
+# ESPN Fantasy Baseball exporter — never commit credentials
+espn_fantasy_export/.env
